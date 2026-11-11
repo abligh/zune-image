@@ -1547,7 +1547,19 @@ fn prepare_header(frame: &mut FrameState, add_image_header: bool, is_last: bool)
         }
         if have_alpha {
             output.put_bits(2, 1); // extra channel
-            output.put_bits(1, 1); // all default (8 bit alpha)
+            if depth == BitDepth::Eight {
+                output.put_bits(1, 1); // all default (8 bit alpha)
+            } else {
+                // The alpha channel's samples are as deep as the color's.
+                output.put_bits(1, 0); // not all default
+                put_enum(output, 0); // alpha
+                output.put_bits(1, 0); // integer samples
+                output.put_bits(2, 0b11);
+                output.put_bits(6, (frame.option.depth().bit_size() - 1) as u64);
+                output.put_bits(2, 0); // dim_shift 0
+                output.put_bits(2, 0); // no name
+                output.put_bits(1, 0); // not premultiplied
+            }
         } else {
             output.put_bits(2, 0); // no extra channel
         }
