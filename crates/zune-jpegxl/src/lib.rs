@@ -86,11 +86,13 @@
 extern crate alloc;
 extern crate core;
 
+pub use color_encoding::{JxlColorEncoding, JxlPrimaries, JxlTransferFunction};
 pub use encoder::JxlSimpleEncoder;
 pub use errors::JxlEncodeErrors;
 
 mod bit_depth;
 mod bit_writer;
 mod color_convert;
+mod color_encoding;
 mod encoder;
 mod errors;

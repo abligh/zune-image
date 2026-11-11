@@ -17,6 +17,8 @@ use zune_core::bytestream::{ZByteWriterTrait, ZWriter};
 use zune_core::log::{log_enabled, trace, Level};
 use zune_core::options::EncoderOptions;
 
+use crate::color_encoding::{enum_bits, JxlColorEncoding};
+
 use crate::bit_depth::{JxlBitEncoder, MoreThan14Bits, UpTo8Bits};
 use crate::bit_writer::{
     encode_hybrid_uint_lz77, encode_hybrid_unit_000, BitWriter, BorrowingBitWriter,
@@ -42,6 +44,7 @@ const K_MAX_NUM_SYMBOLS: usize = if K_NUM_RAW_SYMBOLS + 1 < K_NUM_LZ77 {
 
 pub(crate) struct FrameState {
     option: EncoderOptions,
+    color_encoding: JxlColorEncoding,
     header: BitWriter,
     group_data: Vec<[BitWriter; 4]>,
     current_bit_writer: usize,
@@ -96,6 +99,7 @@ pub(crate) struct FrameState {
 /// }
 /// ```
 pub struct JxlSimpleEncoder<'a> {
+    color_encoding: JxlColorEncoding,
     data: &'a [u8],
     options: EncoderOptions,
 }
@@ -1043,7 +1047,22 @@ impl<'a> JxlSimpleEncoder<'a> {
     /// - data: Raw pixel data
     /// - options: Encoder options for the raw pixels, this include the width, height colorspace, depth etc
     pub fn new(data: &'a [u8], options: EncoderOptions) -> JxlSimpleEncoder<'a> {
-        JxlSimpleEncoder { data, options }
+        JxlSimpleEncoder {
+            data,
+            options,
+            color_encoding: JxlColorEncoding::default()
+        }
+    }
+
+    /// Set the color encoding the image header names, sRGB by default.
+    ///
+    /// The samples are written as given: this says how a decoder
+    /// should read them, their primaries (for RGB) and their transfer
+    /// function. sRGB's is written as the header's `all_default`, as
+    /// it was before the option.
+    pub fn set_color_encoding(&mut self, color_encoding: JxlColorEncoding) -> &mut Self {
+        self.color_encoding = color_encoding;
+        self
     }
 
     /// Encode a jxl image producing the raw encoded
@@ -1303,6 +1322,7 @@ impl<'a> JxlSimpleEncoder<'a> {
 
             Ok(FrameState {
                 option: self.options,
+                color_encoding: self.color_encoding,
                 header: BitWriter::new(),
                 group_data,
                 current_bit_writer: 0,
@@ -1359,6 +1379,7 @@ impl<'a> JxlSimpleEncoder<'a> {
 
             Ok(FrameState {
                 option: self.options,
+                color_encoding: self.color_encoding,
                 header: BitWriter::new(),
                 group_data,
                 current_bit_writer: 0,
@@ -1438,6 +1459,15 @@ fn fast_lossless_output(frame_state: &FrameState) -> usize {
         total_size_groups += sz;
     }
     frame_state.header.position + total_size_groups
+}
+
+/// Writes `value` as the codestream's `Enum` field codes it.
+fn put_enum(output: &mut BitWriter, value: u32) {
+    for (count, bits) in enum_bits(value) {
+        if count > 0 {
+            output.put_bits(count, bits);
+        }
+    }
 }
 
 fn fast_lossless_max_required_output(frame_state: &FrameState) -> usize {
@@ -1525,17 +1555,21 @@ fn prepare_header(frame: &mut FrameState, add_image_header: bool, is_last: bool)
         // TODO: Support XYB
         output.put_bits(1, 0); // not xyb
 
-        if colorspace.num_components() > 2 {
+        let encoding = frame.color_encoding;
+        let rgb = colorspace.num_components() > 2;
+        if rgb && encoding == JxlColorEncoding::default() {
             output.put_bits(1, 1); // color_encoding.all_default (sRGB)
         } else {
             output.put_bits(1, 0); // color_encoding.all_default false
             output.put_bits(1, 0); // color_encoding.want_icc false
-            output.put_bits(2, 1); // grayscale
-            output.put_bits(2, 1); // D65
+            put_enum(output, if rgb { 0 } else { 1 }); // RGB or grayscale
+            put_enum(output, 1); // D65
+            if rgb {
+                put_enum(output, encoding.primaries.value());
+            }
             output.put_bits(1, 0); // no gamma transfer function
-            output.put_bits(2, 0b10); // tf: 2 + u(4)
-            output.put_bits(4, 11); // tf of sRGB
-            output.put_bits(2, 1); // relative rendering intent
+            put_enum(output, encoding.transfer_function.value());
+            put_enum(output, 1); // relative rendering intent
         }
         output.put_bits(2, 0b00); // No extensions.
 

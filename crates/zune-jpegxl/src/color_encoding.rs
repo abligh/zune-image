@@ -1,0 +1,206 @@
+//! The color encoding an image header names: its primaries and its
+//! transfer function, as the JPEG XL codestream's `ColorEncoding` bundle
+//! (ISO/IEC 18181-1, `ColorEncoding`) holds them, with a D65 white
+//! point and the relative rendering intent.
+
+/// The primaries an RGB image's samples are in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JxlPrimaries {
+    /// sRGB's, BT.709's.
+    #[default]
+    Srgb,
+    /// ITU-R BT.2100's, BT.2020's.
+    Bt2100,
+    /// Display P3's: DCI-P3's primaries with a D65 white point.
+    P3
+}
+
+/// How the samples code light.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JxlTransferFunction {
+    /// IEC 61966-2-1's sRGB curve.
+    #[default]
+    Srgb,
+    /// ITU-R BT.709's (and BT.2020's) curve.
+    Bt709,
+    /// Linear light.
+    Linear,
+    /// SMPTE ST 2084's perceptual quantizer.
+    Pq
+}
+
+/// An image's color encoding: sRGB by default, which the header writes
+/// as `all_default`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JxlColorEncoding {
+    /// The primaries, which a grayscale image leaves out.
+    pub primaries:         JxlPrimaries,
+    /// The transfer function.
+    pub transfer_function: JxlTransferFunction
+}
+
+impl JxlPrimaries {
+    /// The codestream's enum value.
+    pub(crate) const fn value(self) -> u32 {
+        match self {
+            JxlPrimaries::Srgb => 1,
+            JxlPrimaries::Bt2100 => 9,
+            JxlPrimaries::P3 => 11
+        }
+    }
+}
+
+impl JxlTransferFunction {
+    /// The codestream's enum value.
+    pub(crate) const fn value(self) -> u32 {
+        match self {
+            JxlTransferFunction::Bt709 => 1,
+            JxlTransferFunction::Linear => 8,
+            JxlTransferFunction::Srgb => 13,
+            JxlTransferFunction::Pq => 16
+        }
+    }
+}
+
+/// An enum value's bits as the codestream's `Enum` field codes it, a
+/// `U32(Val(0), Val(1), BitsOffset(4, 2), BitsOffset(6, 18))`: the
+/// selector's 2 bits, then any extra bits, each as `(count, value)`.
+pub(crate) fn enum_bits(value: u32) -> [(u8, u64); 2] {
+    match value {
+        0 => [(2, 0), (0, 0)],
+        1 => [(2, 1), (0, 0)],
+        2..=17 => [(2, 2), (4, u64::from(value - 2))],
+        _ => [(2, 3), (6, u64::from(value - 18))]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use zune_core::bit_depth::BitDepth;
+    use zune_core::colorspace::ColorSpace;
+    use zune_core::options::EncoderOptions;
+
+    use super::*;
+    use crate::JxlSimpleEncoder;
+
+    /// The codestream's bits, least significant first.
+    struct Bits<'a> {
+        data: &'a [u8],
+        at:   usize
+    }
+
+    impl Bits<'_> {
+        fn read(&mut self, count: usize) -> u32 {
+            let mut value = 0;
+            for i in 0..count {
+                let bit = (self.data[self.at / 8] >> (self.at % 8)) & 1;
+                value |= u32::from(bit) << i;
+                self.at += 1;
+            }
+            value
+        }
+
+        fn read_enum(&mut self) -> u32 {
+            match self.read(2) {
+                0 => 0,
+                1 => 1,
+                2 => 2 + self.read(4),
+                _ => 18 + self.read(6)
+            }
+        }
+    }
+
+    /// A 2 × 2 8-bit image of `colorspace` encoded with `encoding`,
+    /// and its header read up to its color encoding: `None` where that
+    /// is all_default, else its color space, white point, primaries
+    /// (for RGB), transfer function and rendering intent.
+    fn header(colorspace: ColorSpace, encoding: JxlColorEncoding) -> Option<Vec<u32>> {
+        let channels = colorspace.num_components();
+        let data = alloc::vec![100_u8; 4 * channels];
+        let options = EncoderOptions::new(2, 2, colorspace, BitDepth::Eight);
+        let mut encoder = JxlSimpleEncoder::new(&data, options);
+        encoder.set_color_encoding(encoding);
+        let mut out = Vec::new();
+        encoder.encode(&mut out).unwrap();
+        let mut bits = Bits { data: &out, at: 0 };
+        assert_eq!(bits.read(16), 0x0AFF, "signature");
+        assert_eq!(bits.read(1), 0, "not small");
+        assert_eq!((bits.read(2), bits.read(9)), (0, 1), "height 2");
+        assert_eq!(bits.read(3), 0, "no ratio");
+        assert_eq!((bits.read(2), bits.read(9)), (0, 1), "width 2");
+        assert_eq!(bits.read(1), 0, "metadata not all_default");
+        assert_eq!(bits.read(1), 0, "no extra fields");
+        assert_eq!(bits.read(1), 0, "integer samples");
+        assert_eq!(bits.read(2), 0, "8 bits");
+        assert_eq!(bits.read(1), 1, "16-bit buffer suffices");
+        assert_eq!(bits.read(2), u32::from(colorspace.has_alpha()), "extra channels");
+        if colorspace.has_alpha() {
+            assert_eq!(bits.read(1), 1, "default alpha");
+        }
+        assert_eq!(bits.read(1), 0, "not xyb");
+        if bits.read(1) == 1 {
+            return None;
+        }
+        assert_eq!(bits.read(1), 0, "no ICC");
+        let space = bits.read_enum();
+        let mut fields = alloc::vec![space, bits.read_enum()];
+        if space == 0 {
+            fields.push(bits.read_enum());
+        }
+        assert_eq!(bits.read(1), 0, "no gamma");
+        fields.push(bits.read_enum());
+        fields.push(bits.read_enum());
+        Some(fields)
+    }
+
+    #[test]
+    fn srgb_is_all_default_and_others_are_named() {
+        use JxlPrimaries as P;
+        use JxlTransferFunction as T;
+        for colorspace in [ColorSpace::RGB, ColorSpace::RGBA] {
+            assert_eq!(header(colorspace, JxlColorEncoding::default()), None);
+            for (primaries, p) in [(P::Srgb, 1), (P::Bt2100, 9), (P::P3, 11)] {
+                for (transfer_function, t) in
+                    [(T::Srgb, 13), (T::Bt709, 1), (T::Linear, 8), (T::Pq, 16)]
+                {
+                    let encoding = JxlColorEncoding {
+                        primaries,
+                        transfer_function
+                    };
+                    let want = (encoding != JxlColorEncoding::default())
+                        .then(|| alloc::vec![0, 1, p, t, 1]);
+                    assert_eq!(header(colorspace, encoding), want, "{encoding:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grayscale_names_its_transfer_and_no_primaries() {
+        for (transfer_function, t) in [
+            (JxlTransferFunction::Srgb, 13),
+            (JxlTransferFunction::Bt709, 1),
+            (JxlTransferFunction::Pq, 16)
+        ] {
+            let encoding = JxlColorEncoding {
+                primaries: JxlPrimaries::P3,
+                transfer_function
+            };
+            assert_eq!(
+                header(ColorSpace::Luma, encoding),
+                Some(alloc::vec![1, 1, t, 1])
+            );
+        }
+    }
+
+    #[test]
+    fn an_enum_value_is_coded_by_its_range() {
+        assert_eq!(enum_bits(0), [(2, 0), (0, 0)]);
+        assert_eq!(enum_bits(1), [(2, 1), (0, 0)]);
+        assert_eq!(enum_bits(13), [(2, 2), (4, 11)]);
+        assert_eq!(enum_bits(17), [(2, 2), (4, 15)]);
+        assert_eq!(enum_bits(18), [(2, 3), (6, 0)]);
+    }
+}
