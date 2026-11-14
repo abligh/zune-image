@@ -233,6 +233,68 @@ mod tests {
         assert_eq!(alpha_info(BitDepth::Sixteen), Some([0, 16, 0, 0, 0]));
     }
 
+    /// A 2 × 2 8-bit RGB image in BT.2100 PQ, its intensity target
+    /// `nits` where that is given, and its header read past its color
+    /// encoding: its extra fields where it has them (orientation,
+    /// intrinsic size, preview, animation) and its tone mapping fields
+    /// (all_default, then intensity target, minimum nits, relative to
+    /// the display's maximum and linear below), and the bits following.
+    fn tone_mapping(nits: Option<f32>) -> (Option<[u32; 4]>, Option<[u32; 5]>, u32) {
+        let data = alloc::vec![100_u8; 12];
+        let options = EncoderOptions::new(2, 2, ColorSpace::RGB, BitDepth::Eight);
+        let mut encoder = JxlSimpleEncoder::new(&data, options);
+        encoder.set_color_encoding(JxlColorEncoding {
+            primaries:         JxlPrimaries::Bt2100,
+            transfer_function: JxlTransferFunction::Pq
+        });
+        if let Some(nits) = nits {
+            encoder.set_intensity_target(nits);
+        }
+        let mut out = Vec::new();
+        encoder.encode(&mut out).unwrap();
+        let mut bits = Bits { data: &out, at: 0 };
+        // Signature, size and the metadata's all_default.
+        bits.at = 16 + 1 + 11 + 3 + 11;
+        assert_eq!(bits.read(1), 0, "metadata not all_default");
+        let extra = (bits.read(1) == 1)
+            .then(|| [bits.read(3), bits.read(1), bits.read(1), bits.read(1)]);
+        assert_eq!(bits.read(1), 0, "integer samples");
+        assert_eq!(bits.read(2), 0, "8 bits");
+        assert_eq!(bits.read(1), 1, "16-bit buffer suffices");
+        assert_eq!(bits.read(2), 0, "no extra channels");
+        assert_eq!(bits.read(1), 0, "not xyb");
+        assert_eq!(bits.read(1), 0, "color encoding not all_default");
+        assert_eq!(bits.read(1), 0, "no ICC");
+        let named = [(); 3].map(|()| bits.read_enum());
+        assert_eq!(named, [0, 1, 9], "RGB, D65, BT.2100");
+        assert_eq!(bits.read(1), 0, "no gamma");
+        assert_eq!([bits.read_enum(), bits.read_enum()], [16, 1], "PQ, relative");
+        let fields = extra.map(|_| {
+            [
+                bits.read(1),
+                bits.read(16),
+                bits.read(16),
+                bits.read(1),
+                bits.read(16)
+            ]
+        });
+        // No extensions, then the transform data's all_default.
+        (extra, fields, bits.read(3))
+    }
+
+    #[test]
+    fn an_intensity_target_other_than_255_is_written_in_the_tone_mapping() {
+        // 10000 nits as a half float is 0x70E2.
+        assert_eq!(
+            tone_mapping(Some(10000.0)),
+            (Some([0, 0, 0, 0]), Some([0, 0x70E2, 0, 0, 0]), 0b100)
+        );
+        assert_eq!(tone_mapping(Some(1000.0)).1, Some([0, 0x63D0, 0, 0, 0]));
+        // 255, the default, given or not, is left unwritten.
+        assert_eq!(tone_mapping(None), (None, None, 0b100));
+        assert_eq!(tone_mapping(Some(255.0)), (None, None, 0b100));
+    }
+
     #[test]
     fn an_enum_value_is_coded_by_its_range() {
         assert_eq!(enum_bits(0), [(2, 0), (0, 0)]);

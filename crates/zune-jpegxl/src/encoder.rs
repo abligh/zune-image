@@ -45,6 +45,7 @@ const K_MAX_NUM_SYMBOLS: usize = if K_NUM_RAW_SYMBOLS + 1 < K_NUM_LZ77 {
 pub(crate) struct FrameState {
     option: EncoderOptions,
     color_encoding: JxlColorEncoding,
+    intensity_target: f32,
     header: BitWriter,
     group_data: Vec<[BitWriter; 4]>,
     current_bit_writer: usize,
@@ -100,6 +101,7 @@ pub(crate) struct FrameState {
 /// ```
 pub struct JxlSimpleEncoder<'a> {
     color_encoding: JxlColorEncoding,
+    intensity_target: f32,
     data: &'a [u8],
     options: EncoderOptions,
 }
@@ -1050,8 +1052,23 @@ impl<'a> JxlSimpleEncoder<'a> {
         JxlSimpleEncoder {
             data,
             options,
-            color_encoding: JxlColorEncoding::default()
+            color_encoding: JxlColorEncoding::default(),
+            intensity_target: DEFAULT_INTENSITY_TARGET
         }
+    }
+
+    /// Set the image's intensity target, in nits: how bright its
+    /// brightest value, 1.0 of a linear sample, is meant to be shown.
+    /// 255 by default, which the header leaves unwritten; any other
+    /// value is written in its tone mapping fields. A PQ image's is
+    /// 10000, where its code values are absolute, so a decoder tone
+    /// mapping it for a dimmer display knows where its peak is.
+    ///
+    /// The encode fails where the value is not a positive number a
+    /// half float holds (at most 65504).
+    pub fn set_intensity_target(&mut self, nits: f32) -> &mut Self {
+        self.intensity_target = nits;
+        self
     }
 
     /// Set the color encoding the image header names, sRGB by default.
@@ -1079,6 +1096,11 @@ impl<'a> JxlSimpleEncoder<'a> {
         }
         if self.options.height() <= 1 {
             return Err(JxlEncodeErrors::ZeroDimension("height"));
+        }
+        if half_float(self.intensity_target).is_none() {
+            return Err(JxlEncodeErrors::Generic(
+                "the intensity target is not a positive half float"
+            ));
         }
         let depth = self.options.depth();
 
@@ -1323,6 +1345,7 @@ impl<'a> JxlSimpleEncoder<'a> {
             Ok(FrameState {
                 option: self.options,
                 color_encoding: self.color_encoding,
+                intensity_target: self.intensity_target,
                 header: BitWriter::new(),
                 group_data,
                 current_bit_writer: 0,
@@ -1380,6 +1403,7 @@ impl<'a> JxlSimpleEncoder<'a> {
             Ok(FrameState {
                 option: self.options,
                 color_encoding: self.color_encoding,
+                intensity_target: self.intensity_target,
                 header: BitWriter::new(),
                 group_data,
                 current_bit_writer: 0,
@@ -1527,8 +1551,17 @@ fn prepare_header(frame: &mut FrameState, add_image_header: bool, is_last: bool)
 
         write_header(frame.option.width(), false);
         // hand crafted image metadata
+        // The tone mapping fields are among the extra fields, so are
+        // written only where they differ from their defaults.
+        let tone_mapped = frame.intensity_target != DEFAULT_INTENSITY_TARGET;
         output.put_bits(1, 0); // defaults
-        output.put_bits(1, 0); // extra fields
+        output.put_bits(1, u64::from(tone_mapped)); // extra fields
+        if tone_mapped {
+            output.put_bits(3, 0); // orientation 1, as stored
+            output.put_bits(1, 0); // no intrinsic size
+            output.put_bits(1, 0); // no preview
+            output.put_bits(1, 0); // no animation
+        }
         output.put_bits(1, 0); // bit depth floating point sample
 
         match depth {
@@ -1582,6 +1615,15 @@ fn prepare_header(frame: &mut FrameState, add_image_header: bool, is_last: bool)
             output.put_bits(1, 0); // no gamma transfer function
             put_enum(output, encoding.transfer_function.value());
             put_enum(output, 1); // relative rendering intent
+        }
+        if tone_mapped {
+            // Checked by encode.
+            let target = half_float(frame.intensity_target).unwrap_or(0);
+            output.put_bits(1, 0); // tone_mapping.all_default false
+            output.put_bits(16, u64::from(target)); // intensity_target
+            output.put_bits(16, 0); // min_nits 0
+            output.put_bits(1, 0); // not relative_to_max_display
+            output.put_bits(16, 0); // linear_below 0
         }
         output.put_bits(2, 0b00); // No extensions.
 
@@ -1648,6 +1690,32 @@ fn calculate_expected_input(options: &EncoderOptions) -> Option<usize> {
         .and_then(|x| x.checked_mul(options.colorspace().num_components()))
 }
 
+/// The intensity target the header's tone mapping fields default to,
+/// in nits.
+const DEFAULT_INTENSITY_TARGET: f32 = 255.0;
+
+/// `value`'s bits as an IEEE 754 half float, rounded to the nearest,
+/// ties to even: `None` unless it is positive, finite and normal as a
+/// half (from 2^-14 to 65504).
+fn half_float(value: f32) -> Option<u16> {
+    if !(value.is_finite() && value > 0.0) {
+        return None;
+    }
+    let bits = value.to_bits();
+    let exponent = ((bits >> 23) & 0xff) as i32 - 127;
+    if !(-14..=15).contains(&exponent) {
+        return None;
+    }
+    let mantissa = bits & 0x7f_ffff;
+    let mut half = (((exponent + 15) as u32) << 10) | (mantissa >> 13);
+    let rest = mantissa & 0x1fff;
+    if rest > 0x1000 || (rest == 0x1000 && half & 1 == 1) {
+        half += 1;
+    }
+    // Rounding up past 65504 reaches infinity.
+    (half < 0x7c00).then_some(half as u16)
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::vec;
@@ -1687,6 +1755,51 @@ mod tests {
         }
         let huge = EncoderOptions::new(usize::MAX / 2, 3, ColorSpace::RGB, BitDepth::Eight);
         assert_eq!(calculate_expected_input(&huge), None);
+    }
+
+    #[test]
+    fn a_half_float_rounds_to_the_nearest_and_holds_only_positive_normals() {
+        assert_eq!(half_float(1.0), Some(0x3C00));
+        assert_eq!(half_float(255.0), Some(0x5BF8));
+        assert_eq!(half_float(10000.0), Some(0x70E2));
+        assert_eq!(half_float(65504.0), Some(0x7BFF));
+        assert_eq!(half_float(f32::powi(2.0, -14)), Some(0x0400));
+        // 1 + 2^-11 is halfway between halves: to the even, down; 1 +
+        // 3 × 2^-11 halfway again: to the even, up; just past halfway, up.
+        assert_eq!(half_float(1.0 + f32::powi(2.0, -11)), Some(0x3C00));
+        assert_eq!(half_float(1.0 + 3.0 * f32::powi(2.0, -11)), Some(0x3C02));
+        assert_eq!(
+            half_float(1.0 + f32::powi(2.0, -11) + f32::powi(2.0, -20)),
+            Some(0x3C01)
+        );
+        // Rounded past 65504 is infinity.
+        for value in [
+            65520.0,
+            1e6,
+            f32::powi(2.0, -15),
+            0.0,
+            -1.0,
+            f32::NAN,
+            f32::INFINITY
+        ] {
+            assert_eq!(half_float(value), None, "{value}");
+        }
+    }
+
+    /// An intensity target no half float holds fails the encode.
+    #[test]
+    fn an_intensity_target_must_be_a_positive_half_float() {
+        let data = vec![7_u8; 12];
+        let options = EncoderOptions::new(2, 2, ColorSpace::RGB, BitDepth::Eight);
+        for nits in [0.0, -255.0, 1e6, f32::NAN] {
+            let mut out = Vec::new();
+            let mut encoder = JxlSimpleEncoder::new(&data, options);
+            encoder.set_intensity_target(nits);
+            assert!(
+                matches!(encoder.encode(&mut out), Err(JxlEncodeErrors::Generic(_))),
+                "{nits}"
+            );
+        }
     }
 }
 
